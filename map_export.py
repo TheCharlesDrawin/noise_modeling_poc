@@ -4,7 +4,6 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from pyproj import Transformer
 
-LEVEL_BREAKS = [-5, 0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70]
 LEVEL_COLORS = [
     "#30123b",
     "#4145ab",
@@ -136,18 +135,18 @@ def _get_center_from_source(source_geojson: Dict) -> Optional[List[float]]:
     return [lat, lon]
 
 
-def _noise_color(value: float) -> str:
-    for idx in range(len(LEVEL_BREAKS) - 1):
-        if LEVEL_BREAKS[idx] <= value < LEVEL_BREAKS[idx + 1]:
+def _noise_color(value: float, level_breaks: List[float]) -> str:
+    for idx in range(len(level_breaks) - 1):
+        if level_breaks[idx] <= value < level_breaks[idx + 1]:
             return LEVEL_COLORS[idx]
-    if value < LEVEL_BREAKS[0]:
+    if value < level_breaks[0]:
         return LEVEL_COLORS[0]
     return LEVEL_COLORS[-1]
 
 
-def _noise_opacity(value: float) -> float:
-    min_level = LEVEL_BREAKS[0]
-    max_level = LEVEL_BREAKS[-1]
+def _noise_opacity(value: float, level_breaks: List[float]) -> float:
+    min_level = level_breaks[0]
+    max_level = level_breaks[-1]
     if value <= min_level:
         return 0.28
     if value >= max_level:
@@ -164,17 +163,58 @@ def _noise_value(props: Dict) -> float:
         return 0.0
 
 
-def _add_legend(m) -> None:
+def _percentile(sorted_values: List[float], p: float) -> float:
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    p = max(0.0, min(1.0, p))
+    idx = p * (len(sorted_values) - 1)
+    lo = int(idx)
+    hi = min(lo + 1, len(sorted_values) - 1)
+    frac = idx - lo
+    return sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac
+
+
+def _compute_level_breaks(values: List[float], bin_count: int) -> List[float]:
+    if not values:
+        return [float(i) for i in range(bin_count + 1)]
+
+    sorted_values = sorted(values)
+    lo = _percentile(sorted_values, 0.05)
+    hi = _percentile(sorted_values, 0.95)
+
+    if hi - lo < 0.5:
+        lo = min(sorted_values) - 0.25
+        hi = max(sorted_values) + 0.25
+    if hi - lo < 0.01:
+        hi = lo + 1.0
+
+    step = (hi - lo) / bin_count
+    breaks = [lo + (step * i) for i in range(bin_count + 1)]
+    breaks[0] = min(breaks[0], min(sorted_values))
+    breaks[-1] = max(breaks[-1], max(sorted_values))
+    return breaks
+
+
+def _extract_noise_values(geojson: Dict) -> List[float]:
+    values = []
+    for feature in geojson.get("features", []):
+        values.append(_noise_value(feature.get("properties", {})))
+    return values
+
+
+def _add_legend(m, level_breaks: List[float]) -> None:
     from branca.element import Element
 
     rows = []
     for idx, color in enumerate(LEVEL_COLORS):
-        low = LEVEL_BREAKS[idx]
-        high = LEVEL_BREAKS[idx + 1]
+        low = level_breaks[idx]
+        high = level_breaks[idx + 1]
         rows.append(
             f'<div style="display:flex;align-items:center;margin:2px 0;">'
             f'<span style="display:inline-block;width:14px;height:14px;background:{color};margin-right:8px;border:1px solid #333;"></span>'
-            f"<span>{low} to {high} dB</span>"
+            f"<span>{low:.1f} to {high:.1f} dB</span>"
             f"</div>"
         )
 
@@ -216,6 +256,7 @@ def export_folium_map(output_folder: Path, source_epsg: int = 3857) -> Optional[
         return None
 
     primary_geojson = _to_wgs84(_load_geojson(primary_path), source_epsg)
+    level_breaks = _compute_level_breaks(_extract_noise_values(primary_geojson), len(LEVEL_COLORS))
 
     source_geojson = _to_wgs84(_load_geojson(source_path), source_epsg) if source_path.exists() else None
     buildings_geojson = _to_wgs84(_load_geojson(buildings_path), source_epsg) if buildings_path.exists() else None
@@ -237,12 +278,12 @@ def export_folium_map(output_folder: Path, source_epsg: int = 3857) -> Optional[
     def primary_style_fn(feature: Dict) -> Dict:
         props = feature.get("properties", {})
         level_value = _noise_value(props)
-        color = _noise_color(level_value)
+        color = _noise_color(level_value, level_breaks)
         return {
             "color": "#1e1e1e",
             "weight": 0.6,
             "fillColor": color,
-            "fillOpacity": _noise_opacity(level_value),
+            "fillOpacity": _noise_opacity(level_value, level_breaks),
         }
 
     tooltip_candidates = ["ISOLVL", "ISOLABEL", "LAEQ", "LEQ", "PERIOD"]
@@ -263,7 +304,7 @@ def export_folium_map(output_folder: Path, source_epsg: int = 3857) -> Optional[
             if lon is None or lat is None:
                 continue
             level_value = _noise_value(props)
-            color = _noise_color(level_value)
+            color = _noise_color(level_value, level_breaks)
             popup_lines = [f"<b>Noise:</b> {level_value:.1f} dB"]
             for key in ("IDRECEIVER", "PERIOD", "LAEQ", "LEQ"):
                 if key in props:
@@ -275,7 +316,7 @@ def export_folium_map(output_folder: Path, source_epsg: int = 3857) -> Optional[
                 weight=0.5,
                 fill=True,
                 fill_color=color,
-                fill_opacity=_noise_opacity(level_value),
+                fill_opacity=_noise_opacity(level_value, level_breaks),
                 popup=folium.Popup("<br>".join(popup_lines), max_width=260),
             ).add_to(points_group)
         points_group.add_to(m)
@@ -325,7 +366,7 @@ def export_folium_map(output_folder: Path, source_epsg: int = 3857) -> Optional[
     if bounds:
         m.fit_bounds(bounds)
 
-    _add_legend(m)
+    _add_legend(m, level_breaks)
     folium.LayerControl(collapsed=False).add_to(m)
 
     output_path = output_folder / "noise_map.html"
