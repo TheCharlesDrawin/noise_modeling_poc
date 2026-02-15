@@ -21,6 +21,7 @@ from commands import (
     RandomReceivers,
 )
 from gis_utils import point_to_square
+from map_export import export_folium_map
 
 
 async def run_with_timeout(command: List[str], env: dict):
@@ -147,6 +148,15 @@ def run_noise_modelling(
 
         else:
             subprocess.run(command_list, env=env, check=True, text=True)
+
+    try:
+        html_map_path = export_folium_map(output_folder)
+        if html_map_path is not None:
+            print(f"Saved interactive map to: {html_map_path}")
+        else:
+            print("Skipped Folium export: no noise_map.geojson or receivers_level.geojson found.")
+    except Exception as exc:
+        print(f"Failed to export Folium map: {exc}")
 
 def main():
     parser = argparse.ArgumentParser(description='Run noise modelling with configurable parameters')

@@ -12,3 +12,9 @@
 
 # Run
 - python3 main.py
+
+## Folium HTML export
+- Install dependency:
+  - `pip install folium`
+- After each run, the script now writes an interactive browser map to:
+  - `output/<run_name>/noise_map.html`
