@@ -1,0 +1,11 @@
+{
+"type": "FeatureCollection",
+"name": "route_source",
+"crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:EPSG::3857" } },
+"features": [
+{ "type": "Feature", "properties": { "PK": 1, "HZD500": 90.0 }, "geometry": { "type": "Point", "coordinates": [ 3953568.32856056606397, 3892702.774056970141828, 1350.0 ] } },
+{ "type": "Feature", "properties": { "PK": 12, "HZD500": 12.0 }, "geometry": { "type": "Point", "coordinates": [ 3953396.178790463134646, 3893164.382553207222372, 0.0 ] } },
+{ "type": "Feature", "properties": { "PK": 123, "HZD500": 123.0 }, "geometry": { "type": "Point", "coordinates": [ 3953437.246091578621417, 3893753.013869197107852, 0.0 ] } },
+{ "type": "Feature", "properties": { "PK": 3123, "HZD500": 12314.0 }, "geometry": { "type": "Point", "coordinates": [ 3953930.05370496539399, 3894225.287832025904208, 0.0 ] } }
+]
+}

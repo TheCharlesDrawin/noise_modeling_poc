@@ -1,0 +1,5 @@
+NoiseModelling_without_gui/
+__pycache__/
+h2gisdb*
+*.log
+output/

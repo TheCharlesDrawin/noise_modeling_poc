@@ -1,0 +1,21 @@
+{
+    "type": "FeatureCollection",
+    "name": "Point_Source",
+    "features": [
+        {
+            "type": "Feature",
+            "properties": {
+                "PK": 1,
+                "HZD500": 90.0
+            },
+            "geometry": {
+                "type": "Point",
+                "coordinates": [
+                    3888467.426079071,
+                    3631147.3750864393,
+                    650.0
+                ]
+            }
+        }
+    ]
+}
