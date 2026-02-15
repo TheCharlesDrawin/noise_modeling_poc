@@ -4,6 +4,25 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from pyproj import Transformer
 
+LEVEL_BREAKS = [-5, 0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70]
+LEVEL_COLORS = [
+    "#30123b",
+    "#4145ab",
+    "#4687e3",
+    "#39b7ea",
+    "#1cd5cb",
+    "#24e68a",
+    "#5ff45a",
+    "#a4fc3c",
+    "#dffa2f",
+    "#f9d925",
+    "#fbb61a",
+    "#f98e09",
+    "#ef5e1a",
+    "#d7352a",
+    "#b60f2e",
+]
+
 
 def _transform_position(coord: List[float], transformer: Transformer) -> List[float]:
     lon, lat = transformer.transform(coord[0], coord[1])
@@ -118,19 +137,56 @@ def _get_center_from_source(source_geojson: Dict) -> Optional[List[float]]:
 
 
 def _noise_color(value: float) -> str:
-    if value < 5:
-        return "#2c7bb6"
-    if value < 15:
-        return "#00a6ca"
-    if value < 25:
-        return "#00ccbc"
-    if value < 35:
-        return "#90eb9d"
-    if value < 45:
-        return "#f9d057"
-    if value < 55:
-        return "#f29e2e"
-    return "#d7191c"
+    for idx in range(len(LEVEL_BREAKS) - 1):
+        if LEVEL_BREAKS[idx] <= value < LEVEL_BREAKS[idx + 1]:
+            return LEVEL_COLORS[idx]
+    if value < LEVEL_BREAKS[0]:
+        return LEVEL_COLORS[0]
+    return LEVEL_COLORS[-1]
+
+
+def _noise_opacity(value: float) -> float:
+    min_level = LEVEL_BREAKS[0]
+    max_level = LEVEL_BREAKS[-1]
+    if value <= min_level:
+        return 0.28
+    if value >= max_level:
+        return 0.9
+    ratio = (value - min_level) / (max_level - min_level)
+    return 0.28 + (0.62 * ratio)
+
+
+def _noise_value(props: Dict) -> float:
+    raw_level = props.get("ISOLVL", props.get("LAEQ", props.get("LEQ", 0)))
+    try:
+        return float(raw_level)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _add_legend(m) -> None:
+    from branca.element import Element
+
+    rows = []
+    for idx, color in enumerate(LEVEL_COLORS):
+        low = LEVEL_BREAKS[idx]
+        high = LEVEL_BREAKS[idx + 1]
+        rows.append(
+            f'<div style="display:flex;align-items:center;margin:2px 0;">'
+            f'<span style="display:inline-block;width:14px;height:14px;background:{color};margin-right:8px;border:1px solid #333;"></span>'
+            f"<span>{low} to {high} dB</span>"
+            f"</div>"
+        )
+
+    legend_html = (
+        '<div style="position: fixed; bottom: 28px; right: 14px; z-index: 9999; '
+        'background: rgba(255,255,255,0.94); border: 1px solid #666; border-radius: 6px; '
+        'padding: 10px 12px; font-size: 12px; line-height: 1.2; box-shadow: 0 1px 8px rgba(0,0,0,0.25);">'
+        '<div style="font-weight:700; margin-bottom:6px;">Noise Level</div>'
+        + "".join(rows)
+        + "</div>"
+    )
+    m.get_root().html.add_child(Element(legend_html))
 
 
 def _load_geojson(path: Path) -> Dict:
@@ -173,17 +229,21 @@ def export_folium_map(output_folder: Path, source_epsg: int = 3857) -> Optional[
         else:
             center = [0.0, 0.0]
 
-    m = folium.Map(location=center, zoom_start=14, tiles="CartoDB positron", control_scale=True)
+    m = folium.Map(location=center, zoom_start=14, tiles=None, control_scale=True)
+    folium.TileLayer("CartoDB positron", name="Light").add_to(m)
+    folium.TileLayer("CartoDB dark_matter", name="Dark").add_to(m)
+    folium.TileLayer("OpenStreetMap", name="Street").add_to(m)
 
     def primary_style_fn(feature: Dict) -> Dict:
         props = feature.get("properties", {})
-        level = props.get("ISOLVL", props.get("LAEQ", props.get("LEQ", 0)))
-        try:
-            level_value = float(level)
-        except (TypeError, ValueError):
-            level_value = 0.0
+        level_value = _noise_value(props)
         color = _noise_color(level_value)
-        return {"color": color, "weight": 1, "fillColor": color, "fillOpacity": 0.5}
+        return {
+            "color": "#1e1e1e",
+            "weight": 0.6,
+            "fillColor": color,
+            "fillOpacity": _noise_opacity(level_value),
+        }
 
     tooltip_candidates = ["ISOLVL", "ISOLABEL", "LAEQ", "LEQ", "PERIOD"]
     tooltip_fields = []
@@ -191,12 +251,41 @@ def export_folium_map(output_folder: Path, source_epsg: int = 3857) -> Optional[
         first_props = primary_geojson["features"][0].get("properties", {})
         tooltip_fields = [k for k in tooltip_candidates if k in first_props]
 
-    folium.GeoJson(
-        primary_geojson,
-        name=primary_name,
-        style_function=primary_style_fn,
-        tooltip=folium.features.GeoJsonTooltip(fields=tooltip_fields) if tooltip_fields else None,
-    ).add_to(m)
+    is_point_layer = all(
+        f.get("geometry", {}).get("type") == "Point" for f in primary_geojson.get("features", [])
+    )
+    if is_point_layer:
+        points_group = folium.FeatureGroup(name=primary_name)
+        for feature in primary_geojson.get("features", []):
+            geometry = feature.get("geometry", {})
+            props = feature.get("properties", {})
+            lon, lat = geometry.get("coordinates", [None, None])[:2]
+            if lon is None or lat is None:
+                continue
+            level_value = _noise_value(props)
+            color = _noise_color(level_value)
+            popup_lines = [f"<b>Noise:</b> {level_value:.1f} dB"]
+            for key in ("IDRECEIVER", "PERIOD", "LAEQ", "LEQ"):
+                if key in props:
+                    popup_lines.append(f"<b>{key}:</b> {props[key]}")
+            folium.CircleMarker(
+                location=[lat, lon],
+                radius=4,
+                color="#202020",
+                weight=0.5,
+                fill=True,
+                fill_color=color,
+                fill_opacity=_noise_opacity(level_value),
+                popup=folium.Popup("<br>".join(popup_lines), max_width=260),
+            ).add_to(points_group)
+        points_group.add_to(m)
+    else:
+        folium.GeoJson(
+            primary_geojson,
+            name=primary_name,
+            style_function=primary_style_fn,
+            tooltip=folium.features.GeoJsonTooltip(fields=tooltip_fields) if tooltip_fields else None,
+        ).add_to(m)
 
     if model_area_geojson is not None:
         folium.GeoJson(
@@ -213,16 +302,30 @@ def export_folium_map(output_folder: Path, source_epsg: int = 3857) -> Optional[
         ).add_to(m)
 
     if source_geojson is not None:
-        folium.GeoJson(
-            source_geojson,
-            name="Source",
-            marker=folium.CircleMarker(radius=4, color="#cc0000", fill=True, fill_opacity=1),
-        ).add_to(m)
+        source_group = folium.FeatureGroup(name="Source")
+        for feature in source_geojson.get("features", []):
+            geometry = feature.get("geometry", {})
+            if geometry.get("type") != "Point":
+                continue
+            lon, lat = geometry.get("coordinates", [None, None])[:2]
+            if lon is None or lat is None:
+                continue
+            folium.CircleMarker(
+                location=[lat, lon],
+                radius=7,
+                color="#ffffff",
+                weight=2,
+                fill=True,
+                fill_color="#e31a1c",
+                fill_opacity=1.0,
+            ).add_to(source_group)
+        source_group.add_to(m)
 
     bounds = _get_geojson_bounds(primary_geojson)
     if bounds:
         m.fit_bounds(bounds)
 
+    _add_legend(m)
     folium.LayerControl(collapsed=False).add_to(m)
 
     output_path = output_folder / "noise_map.html"
