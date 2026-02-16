@@ -20,7 +20,7 @@ from commands import (
     NoiseLevelFromSource,
     RandomReceivers,
 )
-from gis_utils import point_to_square
+from gis_utils import points_to_bounding_square_geojson, source_geojson_to_points
 from map_export import export_folium_map
 
 
@@ -66,6 +66,7 @@ def run_noise_modelling(
         horizontal_diffraction: bool,
         receivers_layout: ReceiversLayout,
         max_reflection_distance: int,
+        route_step_meters: float,
         input_folder: Path,
         output_folder: Path,
 ):
@@ -74,12 +75,15 @@ def run_noise_modelling(
 
     with open(input_folder / 'source.geojson', 'r', encoding='utf-8') as f:
         source_geojson = json.loads(f.read())
-        for feature in source_geojson['features']:
-            feature['geometry']['coordinates'][2] = source_height
-        modelling_area = point_to_square(source_geojson, size_meters=2000, use_utm=False)
+        source_points_geojson = source_geojson_to_points(
+            source_geojson=source_geojson,
+            source_height=source_height,
+            route_step_meters=route_step_meters,
+        )
+        modelling_area = points_to_bounding_square_geojson(source_points_geojson, size_meters=2000.0)
 
     with open(input_folder / 'source_geojson_with_correct_height.geojson', 'w', encoding='utf-8') as f:
-        f.write(json.dumps(source_geojson))
+        f.write(json.dumps(source_points_geojson))
 
     with open(input_folder / 'modelling_area.geojson', 'w', encoding='utf-8') as f:
         f.write(json.dumps(modelling_area))
@@ -169,6 +173,7 @@ def main():
                        choices=list(ReceiversLayout), help='Receivers layout type')
     parser.add_argument('--input-folder', type=Path, required=True, help='Input folder path containing source data')
     parser.add_argument('--max-reflection-distance', type=int, default=200, help='Maximum reflection distance in meters')
+    parser.add_argument('--route-step-meters', type=float, default=25.0, help='Sampling step (meters) for route sources')
 
     args = parser.parse_args()
 
@@ -185,6 +190,7 @@ def main():
         horizontal_diffraction=args.horizontal_diffraction,
         receivers_layout=args.receivers_layout,
         max_reflection_distance=args.max_reflection_distance,
+        route_step_meters=args.route_step_meters,
         input_folder=args.input_folder,
         output_folder=output_dir
     )

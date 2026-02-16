@@ -12,6 +12,14 @@
 
 # Run
 - python3 main.py
+- `source.geojson` can now be:
+  - `Point` / `MultiPoint`
+  - `LineString` / `MultiLineString` (route is sampled into point sources)
+- Route sampling density is controlled by:
+  - `--route-step-meters` (default `25.0`)
+
+Example route input for Zfat:
+- `inputs/zefat_route_linestring/source_drone_route_zfat.geojson`
 
 ## Folium HTML export
 - Install dependency:
