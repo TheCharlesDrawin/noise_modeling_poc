@@ -11,6 +11,24 @@ import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 from matplotlib import colors
 
+LEVEL_COLORS = [
+    "#30123b",
+    "#4145ab",
+    "#4687e3",
+    "#39b7ea",
+    "#1cd5cb",
+    "#24e68a",
+    "#5ff45a",
+    "#a4fc3c",
+    "#dffa2f",
+    "#f9d925",
+    "#fbb61a",
+    "#f98e09",
+    "#ef5e1a",
+    "#d7352a",
+    "#b60f2e",
+]
+
 
 def _load_geojson(path: Path) -> Dict:
     with open(path, "r", encoding="utf-8") as f:
@@ -61,12 +79,11 @@ def _draw_noise_polygons(ax, noise_map_geojson: Dict):
         return None, None, None
 
     values = np.asarray([_extract_level_value(f.get("properties", {})) for f in features], dtype=float)
-    vmin = float(np.nanmin(values))
-    vmax = float(np.nanmax(values))
-    if vmax <= vmin:
-        vmax = vmin + 1.0
-    norm = colors.Normalize(vmin=vmin, vmax=vmax)
-    cmap = plt.get_cmap("viridis")
+    level_breaks = _compute_level_breaks(values, len(LEVEL_COLORS))
+    cmap = colors.ListedColormap(LEVEL_COLORS)
+    norm = colors.BoundaryNorm(level_breaks, cmap.N, clip=True)
+    vmin = float(level_breaks[0])
+    vmax = float(level_breaks[-1])
 
     for feature in features:
         level = _extract_level_value(feature.get("properties", {}))
@@ -106,17 +123,19 @@ def _draw_receivers_fallback(ax, receivers_level_geojson: Dict):
     ys_arr = np.asarray(ys)
     lv_arr = np.asarray(levels)
 
-    vmin = float(np.nanpercentile(lv_arr, 5))
-    vmax = float(np.nanpercentile(lv_arr, 95))
-    if vmax <= vmin:
-        vmax = vmin + 1.0
+    level_breaks = _compute_level_breaks(lv_arr, len(LEVEL_COLORS))
+    cmap = colors.ListedColormap(LEVEL_COLORS)
+    norm = colors.BoundaryNorm(level_breaks, cmap.N, clip=True)
+    vmin = float(level_breaks[0])
+    vmax = float(level_breaks[-1])
 
     tri = mtri.Triangulation(xs_arr, ys_arr)
     contour = ax.tricontourf(
         tri,
         lv_arr,
-        levels=np.linspace(vmin, vmax, 14),
-        cmap="viridis",
+        levels=level_breaks,
+        cmap=cmap,
+        norm=norm,
         alpha=0.85,
         zorder=1,
     )
@@ -150,6 +169,39 @@ def _extract_receivers_arrays(receivers_level_geojson: Dict) -> Tuple[np.ndarray
     ys = np.asarray([row[2] for row in rows], dtype=float)
     levels = np.asarray([row[3] for row in rows], dtype=float)
     return xs, ys, levels
+
+
+def _percentile(sorted_values: np.ndarray, p: float) -> float:
+    if sorted_values.size == 0:
+        return 0.0
+    if sorted_values.size == 1:
+        return float(sorted_values[0])
+    p = max(0.0, min(1.0, p))
+    idx = p * (sorted_values.size - 1)
+    lo = int(idx)
+    hi = min(lo + 1, sorted_values.size - 1)
+    frac = idx - lo
+    return float(sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac)
+
+
+def _compute_level_breaks(values: np.ndarray, bin_count: int) -> np.ndarray:
+    if values.size == 0:
+        return np.linspace(0.0, float(bin_count), bin_count + 1)
+
+    sorted_values = np.sort(values.astype(float))
+    lo = _percentile(sorted_values, 0.05)
+    hi = _percentile(sorted_values, 0.95)
+
+    if hi - lo < 0.5:
+        lo = float(np.min(sorted_values) - 0.25)
+        hi = float(np.max(sorted_values) + 0.25)
+    if hi - lo < 0.01:
+        hi = lo + 1.0
+
+    breaks = np.linspace(lo, hi, bin_count + 1)
+    breaks[0] = min(float(breaks[0]), float(np.min(sorted_values)))
+    breaks[-1] = max(float(breaks[-1]), float(np.max(sorted_values)))
+    return breaks
 
 
 def _get_bounds(features: List[Dict]) -> Optional[Tuple[float, float, float, float]]:
@@ -238,22 +290,22 @@ def export_route_noise_animation(
             raise ValueError("No valid route-frame receiver files found for animation.")
 
         contour_frame_values = np.vstack(frame_arrays)
-        vmin = float(np.nanpercentile(contour_frame_values, 5))
-        vmax = float(np.nanpercentile(contour_frame_values, 95))
-        if vmax <= vmin:
-            vmax = vmin + 1.0
-
-        contour_levels = np.linspace(vmin, vmax, 14)
+        contour_levels = _compute_level_breaks(contour_frame_values.reshape(-1), len(LEVEL_COLORS))
+        cmap = colors.ListedColormap(LEVEL_COLORS)
+        norm = colors.BoundaryNorm(contour_levels, cmap.N, clip=True)
+        vmin = float(contour_levels[0])
+        vmax = float(contour_levels[-1])
         contour_tri = mtri.Triangulation(base_x, base_y)
         contour_holder[0] = ax.tricontourf(
             contour_tri,
             contour_frame_values[0],
             levels=contour_levels,
-            cmap="viridis",
+            cmap=cmap,
+            norm=norm,
             alpha=0.85,
             zorder=1,
         )
-        sm = plt.cm.ScalarMappable(norm=colors.Normalize(vmin=vmin, vmax=vmax), cmap="viridis")
+        sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
         sm.set_array([])
         colorbar_ref = fig.colorbar(sm, ax=ax, fraction=0.03, pad=0.02)
         colorbar_ref.set_label(f"Noise level ({vmin:.1f} to {vmax:.1f})")
@@ -321,7 +373,8 @@ def export_route_noise_animation(
                 contour_tri,
                 contour_frame_values[index],
                 levels=contour_levels,
-                cmap="viridis",
+                cmap=colors.ListedColormap(LEVEL_COLORS),
+                norm=colors.BoundaryNorm(contour_levels, len(LEVEL_COLORS), clip=True),
                 alpha=0.85,
                 zorder=1,
             )
