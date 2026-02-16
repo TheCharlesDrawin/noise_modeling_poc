@@ -26,3 +26,12 @@ Example route input for Zfat:
   - `pip install folium`
 - After each run, the script now writes an interactive browser map to:
   - `output/<run_name>/noise_map.html`
+
+## Route video export
+- Optional CLI flags:
+  - `--export-route-video` to generate per-route-point noise animation
+  - `--video-fps <int>` to control animation speed (default `2`)
+- Output files:
+  - `output/<run_name>/route_noise_animation.gif`
+- Performance note:
+  - Video export uses the run's existing noise layer (`noise_map.geojson` or `receivers_level.geojson`) and animates the moving route point, so runtime stays close to the original fast run.
