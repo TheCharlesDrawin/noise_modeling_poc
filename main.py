@@ -22,7 +22,7 @@ from commands import (
 )
 from gis_utils import points_to_bounding_square_geojson, source_geojson_to_points
 from map_export import export_folium_map
-from video_export import export_route_noise_animation
+from video_export import export_digital_twin_flyover, export_route_noise_animation
 
 
 def _single_source_feature_collection(source_points_geojson: dict, index: int) -> dict:
@@ -214,13 +214,27 @@ def run_noise_modelling(
                         run_command(frame_command, env)
                     route_frame_paths.append(frame_output_path)
 
-            video_path = export_route_noise_animation(
-                output_folder=output_folder,
-                source_geojson_3857=source_points_geojson,
-                fps=video_fps,
-                receivers_level_frame_paths=route_frame_paths,
-            )
-            print(f"Saved route-point noise animation to: {video_path}")
+            try:
+                video_path = export_route_noise_animation(
+                    output_folder=output_folder,
+                    source_geojson_3857=source_points_geojson,
+                    fps=video_fps,
+                    receivers_level_frame_paths=route_frame_paths,
+                )
+                print(f"Saved route-point noise animation to: {video_path}")
+            except Exception as exc:
+                print(f"Failed to export route-point GIF: {exc}")
+
+            try:
+                flyover_path = export_digital_twin_flyover(
+                    output_folder=output_folder,
+                    source_geojson_3857=source_points_geojson,
+                    receivers_level_frame_paths=route_frame_paths,
+                    fps=video_fps,
+                )
+                print(f"Saved 3D digital twin flyover to: {flyover_path}")
+            except Exception as exc:
+                print(f"Failed to export 3D digital twin flyover: {exc}")
         except Exception as exc:
             print(f"Failed to export route-point video: {exc}")
 

@@ -395,3 +395,390 @@ def export_route_noise_animation(
     ani.save(str(output_path), writer=writer)
     plt.close(fig)
     return output_path
+
+
+def _build_plotly_discrete_colorscale(level_breaks: np.ndarray) -> List[List[object]]:
+    if level_breaks.size < 2:
+        return [[0.0, LEVEL_COLORS[0]], [1.0, LEVEL_COLORS[-1]]]
+
+    lo = float(level_breaks[0])
+    hi = float(level_breaks[-1])
+    if hi <= lo:
+        hi = lo + 1.0
+
+    scale: List[List[object]] = []
+    for idx, color in enumerate(LEVEL_COLORS):
+        left = (float(level_breaks[idx]) - lo) / (hi - lo)
+        right = (float(level_breaks[idx + 1]) - lo) / (hi - lo)
+        left = max(0.0, min(1.0, left))
+        right = max(0.0, min(1.0, right))
+        scale.append([left, color])
+        scale.append([right, color])
+    return scale
+
+
+def _extract_dem_grid(dem_geojson: Dict, max_cells: int = 20000) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    rows: List[Tuple[float, float, float]] = []
+    for feature in dem_geojson.get("features", []):
+        geometry = feature.get("geometry", {})
+        if geometry.get("type") != "Point":
+            continue
+        coords = geometry.get("coordinates", [])
+        if len(coords) < 2:
+            continue
+        z = feature.get("properties", {}).get("Z")
+        if z is None:
+            continue
+        try:
+            rows.append((float(coords[0]), float(coords[1]), float(z)))
+        except (TypeError, ValueError):
+            continue
+
+    if not rows:
+        return None
+
+    xs = sorted({r[0] for r in rows})
+    ys = sorted({r[1] for r in rows})
+    if len(xs) * len(ys) > max_cells:
+        return None
+
+    x_idx = {x: i for i, x in enumerate(xs)}
+    y_idx = {y: i for i, y in enumerate(ys)}
+    z_grid = np.full((len(ys), len(xs)), np.nan, dtype=float)
+    for x, y, z in rows:
+        z_grid[y_idx[y], x_idx[x]] = z
+
+    if np.isnan(z_grid).all():
+        return None
+
+    if np.isnan(z_grid).any():
+        fill = float(np.nanmean(z_grid))
+        z_grid = np.where(np.isnan(z_grid), fill, z_grid)
+
+    return np.asarray(xs, dtype=float), np.asarray(ys, dtype=float), z_grid
+
+
+def _build_buildings_wireframe(
+    buildings_geojson: Dict,
+    center_x: float,
+    center_y: float,
+    z_base: float,
+    max_buildings: int = 260,
+) -> Tuple[List[float], List[float], List[float]]:
+    x_lines: List[float] = []
+    y_lines: List[float] = []
+    z_lines: List[float] = []
+
+    features = buildings_geojson.get("features", [])[:max_buildings]
+    for feature in features:
+        height_raw = feature.get("properties", {}).get("HEIGHT", 8.0)
+        try:
+            height = float(height_raw)
+        except (TypeError, ValueError):
+            height = 8.0
+        height = max(2.0, min(80.0, height))
+
+        for ring in _polygon_rings(feature):
+            if len(ring) < 3:
+                continue
+
+            for p in ring:
+                x_lines.append(float(p[0]) - center_x)
+                y_lines.append(float(p[1]) - center_y)
+                z_lines.append(z_base)
+            x_lines.append(None)
+            y_lines.append(None)
+            z_lines.append(None)
+
+            for p in ring:
+                x_lines.append(float(p[0]) - center_x)
+                y_lines.append(float(p[1]) - center_y)
+                z_lines.append(z_base + height)
+            x_lines.append(None)
+            y_lines.append(None)
+            z_lines.append(None)
+
+            step = max(1, len(ring) // 6)
+            for p in ring[::step]:
+                x0 = float(p[0]) - center_x
+                y0 = float(p[1]) - center_y
+                x_lines.extend([x0, x0, None])
+                y_lines.extend([y0, y0, None])
+                z_lines.extend([z_base, z_base + height, None])
+
+    return x_lines, y_lines, z_lines
+
+
+def export_digital_twin_flyover(
+    output_folder: Path,
+    source_geojson_3857: Dict,
+    receivers_level_frame_paths: Optional[Sequence[Path]] = None,
+    fps: int = 2,
+) -> Path:
+    try:
+        import plotly.graph_objects as go
+    except ModuleNotFoundError:
+        raise ModuleNotFoundError("plotly is required for 3D flyover export. Install with: pip install plotly")
+
+    route_x, route_y = _extract_route_points(source_geojson_3857)
+    if route_x.size == 0:
+        raise ValueError("Cannot export 3D flyover: source route has no point features.")
+
+    buildings_path = output_folder / "buildings.geojson"
+    dem_path = output_folder / "dem.geojson"
+    receivers_level_path = output_folder / "receivers_level.geojson"
+
+    if receivers_level_frame_paths:
+        existing_paths = [p for p in receivers_level_frame_paths if p.exists()]
+    else:
+        existing_paths = []
+    if not existing_paths and receivers_level_path.exists():
+        existing_paths = [receivers_level_path]
+    if not existing_paths:
+        raise FileNotFoundError("No receiver level data found for 3D flyover.")
+
+    first_frame_geojson = _load_geojson(existing_paths[0])
+    base_x, base_y, base_levels = _extract_receivers_arrays(first_frame_geojson)
+    if base_x.size < 3:
+        raise ValueError("Need at least 3 receiver points for 3D flyover.")
+
+    sample_size = min(9000, base_x.size)
+    if sample_size < base_x.size:
+        sample_idx = np.linspace(0, base_x.size - 1, sample_size).astype(int)
+    else:
+        sample_idx = np.arange(base_x.size)
+
+    base_x = base_x[sample_idx]
+    base_y = base_y[sample_idx]
+    base_levels = base_levels[sample_idx]
+
+    frame_levels: List[np.ndarray] = []
+    for frame_path in existing_paths:
+        frame_geojson = _load_geojson(frame_path)
+        frame_x, frame_y, levels = _extract_receivers_arrays(frame_geojson)
+        if frame_x.size < sample_idx.max() + 1:
+            continue
+        if frame_x.size != frame_y.size or frame_x.size != levels.size:
+            continue
+        frame_levels.append(levels[sample_idx])
+
+    if not frame_levels:
+        frame_levels = [base_levels]
+
+    level_matrix = np.vstack(frame_levels)
+    level_breaks = _compute_level_breaks(level_matrix.reshape(-1), len(LEVEL_COLORS))
+    colorscale = _build_plotly_discrete_colorscale(level_breaks)
+    level_lo = float(level_breaks[0])
+    level_hi = float(level_breaks[-1])
+
+    center_x = float(np.mean([float(np.min(base_x)), float(np.max(base_x)), float(np.min(route_x)), float(np.max(route_x))]))
+    center_y = float(np.mean([float(np.min(base_y)), float(np.max(base_y)), float(np.min(route_y)), float(np.max(route_y))]))
+
+    terrain_min_z = 0.0
+    terrain_trace = None
+    if dem_path.exists():
+        dem_geojson = _load_geojson(dem_path)
+        dem_grid = _extract_dem_grid(dem_geojson)
+        if dem_grid is not None:
+            dem_x, dem_y, dem_z = dem_grid
+            terrain_min_z = float(np.min(dem_z))
+            terrain_trace = go.Surface(
+                x=dem_x - center_x,
+                y=dem_y - center_y,
+                z=dem_z,
+                colorscale=[[0.0, "#445b4a"], [0.5, "#5f7f62"], [1.0, "#8ca879"]],
+                showscale=False,
+                opacity=0.93,
+                name="Terrain",
+                hoverinfo="skip",
+            )
+
+    noise_scale = 2.0
+    noise_base_z = terrain_min_z + 8.0
+    noise_z0 = noise_base_z + (level_matrix[0] - level_lo) * noise_scale
+
+    route_x_local = route_x - center_x
+    route_y_local = route_y - center_y
+    route_z = np.full(route_x_local.shape, noise_base_z + 2.0)
+
+    data_traces = []
+    if terrain_trace is not None:
+        data_traces.append(terrain_trace)
+
+    if buildings_path.exists():
+        buildings_geojson = _load_geojson(buildings_path)
+        bx, by, bz = _build_buildings_wireframe(
+            buildings_geojson=buildings_geojson,
+            center_x=center_x,
+            center_y=center_y,
+            z_base=terrain_min_z + 1.0,
+        )
+        data_traces.append(
+            go.Scatter3d(
+                x=bx,
+                y=by,
+                z=bz,
+                mode="lines",
+                line={"color": "#d3d6db", "width": 2},
+                opacity=0.65,
+                name="Buildings",
+                hoverinfo="skip",
+            )
+        )
+
+    data_traces.append(
+        go.Scatter3d(
+            x=route_x_local,
+            y=route_y_local,
+            z=route_z,
+            mode="lines",
+            line={"color": "#ffffff", "width": 6},
+            name="Route",
+            hoverinfo="skip",
+        )
+    )
+
+    noise_trace_index = len(data_traces)
+    data_traces.append(
+        go.Scatter3d(
+            x=base_x - center_x,
+            y=base_y - center_y,
+            z=noise_z0,
+            mode="markers",
+            marker={
+                "size": 2.3,
+                "opacity": 0.88,
+                "color": level_matrix[0],
+                "colorscale": colorscale,
+                "cmin": level_lo,
+                "cmax": level_hi,
+                "colorbar": {"title": "Noise (dB)"},
+            },
+            name="Noise cloud",
+            hovertemplate="Noise: %{marker.color:.1f} dB<extra></extra>",
+        )
+    )
+
+    source_trace_index = len(data_traces)
+    source_start_z = source_geojson_3857.get("features", [{}])[0].get("geometry", {}).get("coordinates", [0, 0, noise_base_z + 35.0])
+    src_z = float(source_start_z[2]) if len(source_start_z) >= 3 else (noise_base_z + 35.0)
+    data_traces.append(
+        go.Scatter3d(
+            x=[route_x_local[0]],
+            y=[route_y_local[0]],
+            z=[src_z],
+            mode="markers",
+            marker={"size": 8, "color": "#ff2a2a", "line": {"color": "#ffffff", "width": 1}},
+            name="Source",
+            hovertemplate="Moving source<extra></extra>",
+        )
+    )
+
+    frame_count = min(route_x_local.size, level_matrix.shape[0])
+    max_span = max(
+        float(np.max(route_x_local) - np.min(route_x_local)),
+        float(np.max(route_y_local) - np.min(route_y_local)),
+        300.0,
+    )
+    eye_r = max_span * 1.35 / 300.0
+    z_eye = max(0.9, eye_r * 0.8)
+
+    frames = []
+    for i in range(frame_count):
+        angle = 2.0 * np.pi * (i / max(1, frame_count))
+        cam = {
+            "eye": {"x": eye_r * np.cos(angle), "y": eye_r * np.sin(angle), "z": z_eye},
+            "center": {"x": 0.0, "y": 0.0, "z": -0.15},
+            "up": {"x": 0.0, "y": 0.0, "z": 1.0},
+        }
+
+        noise_zi = noise_base_z + (level_matrix[i] - level_lo) * noise_scale
+        frame_data = [
+            go.Scatter3d(
+                x=base_x - center_x,
+                y=base_y - center_y,
+                z=noise_zi,
+                mode="markers",
+                marker={
+                    "size": 2.3,
+                    "opacity": 0.88,
+                    "color": level_matrix[i],
+                    "colorscale": colorscale,
+                    "cmin": level_lo,
+                    "cmax": level_hi,
+                },
+                hovertemplate="Noise: %{marker.color:.1f} dB<extra></extra>",
+            ),
+            go.Scatter3d(
+                x=[route_x_local[i]],
+                y=[route_y_local[i]],
+                z=[src_z],
+                mode="markers",
+                marker={"size": 8, "color": "#ff2a2a", "line": {"color": "#ffffff", "width": 1}},
+                hovertemplate="Moving source<extra></extra>",
+            ),
+        ]
+        frames.append(
+            go.Frame(
+                data=frame_data,
+                traces=[noise_trace_index, source_trace_index],
+                name=str(i),
+                layout={"scene": {"camera": cam}, "title": f"3D Noise Flyover ({i + 1}/{frame_count})"},
+            )
+        )
+
+    fig = go.Figure(data=data_traces, frames=frames)
+    fig.update_layout(
+        title=f"3D Noise Flyover (1/{frame_count})",
+        paper_bgcolor="#0e1013",
+        plot_bgcolor="#0e1013",
+        scene={
+            "xaxis": {"title": "X (local m)", "showbackground": False, "color": "#d8dde5"},
+            "yaxis": {"title": "Y (local m)", "showbackground": False, "color": "#d8dde5"},
+            "zaxis": {"title": "Elevation / Noise", "showbackground": False, "color": "#d8dde5"},
+            "aspectmode": "data",
+            "camera": {"eye": {"x": eye_r, "y": -eye_r, "z": z_eye}},
+        },
+        font={"color": "#e6e9ef"},
+        margin={"l": 0, "r": 0, "t": 50, "b": 0},
+        updatemenus=[
+            {
+                "type": "buttons",
+                "showactive": False,
+                "x": 0.02,
+                "y": 0.98,
+                "buttons": [
+                    {
+                        "label": "Play",
+                        "method": "animate",
+                        "args": [None, {"frame": {"duration": int(1000 / max(1, fps)), "redraw": True}, "fromcurrent": True}],
+                    },
+                    {
+                        "label": "Pause",
+                        "method": "animate",
+                        "args": [[None], {"frame": {"duration": 0, "redraw": False}, "mode": "immediate"}],
+                    },
+                ],
+            }
+        ],
+        sliders=[
+            {
+                "active": 0,
+                "x": 0.16,
+                "y": 0.02,
+                "len": 0.8,
+                "steps": [
+                    {
+                        "label": str(i + 1),
+                        "method": "animate",
+                        "args": [[str(i)], {"mode": "immediate", "frame": {"duration": 0, "redraw": True}}],
+                    }
+                    for i in range(frame_count)
+                ],
+            }
+        ],
+    )
+
+    output_path = output_folder / "digital_twin_flyover.html"
+    fig.write_html(str(output_path), include_plotlyjs="cdn")
+    return output_path
