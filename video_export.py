@@ -780,5 +780,6 @@ def export_digital_twin_flyover(
     )
 
     output_path = output_folder / "digital_twin_flyover.html"
-    fig.write_html(str(output_path), include_plotlyjs="cdn")
+    # Embed plotly.js so the file is fully self-contained and works offline.
+    fig.write_html(str(output_path), include_plotlyjs=True)
     return output_path
