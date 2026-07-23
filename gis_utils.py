@@ -1,6 +1,7 @@
 import pyproj
 from pyproj import Transformer
 import pyproj
+from pathlib import Path
 from typing import Tuple
 from typing import Dict, Iterable, List, Optional
 
@@ -172,6 +173,58 @@ def source_geojson_to_points(source_geojson: Dict, source_height: float, route_s
         "crs": {"type": "name", "properties": {"name": "urn:ogc:def:crs:EPSG::3857"}},
         "features": out_features,
     }
+
+
+def add_agl_height_from_asc(
+    source_points_geojson: Dict,
+    asc_path: Path,
+    height_agl_meters: float,
+) -> Dict:
+    """Set point Z to terrain elevation plus the requested AGL height.
+
+    ESRI ASCII-grid rows are stored north-to-south while ``yllcorner`` is the
+    southern edge, hence the row-index inversion below. Nearest-cell sampling
+    is sufficient for the relatively coarse bundled terrain model.
+    """
+    if height_agl_meters < 0:
+        raise ValueError("height_agl_meters must be non-negative")
+
+    with open(asc_path, "r", encoding="utf-8") as asc_file:
+        header = {}
+        for _ in range(6):
+            key, value = asc_file.readline().split()[:2]
+            header[key.lower()] = float(value)
+        rows = [[float(value) for value in line.split()] for line in asc_file if line.strip()]
+
+    ncols = int(header["ncols"])
+    nrows = int(header["nrows"])
+    x_origin = header.get("xllcorner", header.get("xllcenter"))
+    y_origin = header.get("yllcorner", header.get("yllcenter"))
+    cellsize = header["cellsize"]
+    nodata = header.get("nodata_value")
+
+    if x_origin is None or y_origin is None or len(rows) != nrows or any(len(row) != ncols for row in rows):
+        raise ValueError(f"Invalid ESRI ASCII grid: {asc_path}")
+
+    for feature in source_points_geojson.get("features", []):
+        coordinates = feature.get("geometry", {}).get("coordinates", [])
+        if len(coordinates) < 2:
+            continue
+        x, y = float(coordinates[0]), float(coordinates[1])
+        column = int((x - x_origin) // cellsize)
+        row_from_south = int((y - y_origin) // cellsize)
+        row = nrows - 1 - row_from_south
+        if not (0 <= column < ncols and 0 <= row < nrows):
+            raise ValueError(f"Route point ({x}, {y}) is outside terrain grid {asc_path}")
+        ground_elevation = rows[row][column]
+        if nodata is not None and ground_elevation == nodata:
+            raise ValueError(f"Route point ({x}, {y}) falls on NODATA terrain in {asc_path}")
+        coordinates[:] = [x, y, ground_elevation + height_agl_meters]
+        properties = feature.setdefault("properties", {})
+        properties["GROUND_ELEVATION"] = ground_elevation
+        properties["HEIGHT_AGL"] = height_agl_meters
+
+    return source_points_geojson
 
 
 def points_to_bounding_square_geojson(source_points_geojson: Dict, size_meters: float = 2000.0) -> Dict:

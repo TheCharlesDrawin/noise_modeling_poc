@@ -1,8 +1,9 @@
 import argparse
-import asyncio
 import json
 import os
+import signal
 import subprocess
+import time
 from pathlib import Path
 from custom_types import ReceiversLayout
 from typing import List
@@ -20,9 +21,11 @@ from commands import (
     NoiseLevelFromSource,
     RandomReceivers,
 )
-from gis_utils import points_to_bounding_square_geojson, source_geojson_to_points
+from gis_utils import add_agl_height_from_asc, points_to_bounding_square_geojson, source_geojson_to_points
 from map_export import export_folium_map
 from video_export import export_digital_twin_flyover, export_route_noise_animation
+from acoustic_profiles import apply_medium_agricultural_profile
+from kml_utils import load_kml_routes
 
 
 def _single_source_feature_collection(source_points_geojson: dict, index: int) -> dict:
@@ -37,39 +40,40 @@ def _single_source_feature_collection(source_points_geojson: dict, index: int) -
     }
 
 
-async def run_with_timeout(command: List[str], env: dict):
-    process = await asyncio.create_subprocess_exec(
-    *command, 
-    env=env,
-    stdout=asyncio.subprocess.PIPE,
-    stderr=asyncio.subprocess.STDOUT
+def run_with_stuck_protection(command: List[str], env: dict):
+    process = subprocess.Popen(
+        command,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
     )
-    
-    await asyncio.sleep(5)  # Give some time for the process to run
+    time.sleep(5)
 
     try:
-        timeout = 2
         while True:
-            # Read the last line from log file instead of stdout
-            log_file_path = "application.log"  # Adjust path as needed
-
-            with open(log_file_path, 'r', encoding='utf-8') as log_file:
+            with open("application.log", "r", encoding="utf-8") as log_file:
                 lines = log_file.readlines()
                 last_line = lines[-1].strip() if lines else ""
 
             print(f"Checking last log line: {last_line}")
 
-            if last_line[-4:] == 'done':
-                print("Process completed successfully.") 
+            if last_line.endswith("done"):
+                print("Process completed successfully.")
                 break
+            if process.poll() is not None:
+                raise subprocess.CalledProcessError(process.returncode, command)
 
-            await asyncio.sleep(timeout)
+            time.sleep(2)
 
     finally:
-        if process.returncode is None:
+        if process.poll() is None:
             print("Terminating process...")
-            subprocess.check_call(['kill', '-9', str(process.pid)])
-            await process.wait()
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        process.wait()
 
 
 def run_command(command, env: dict) -> None:
@@ -78,7 +82,7 @@ def run_command(command, env: dict) -> None:
 
     if command.may_stuck:
         print("Running command with stuck protection (timeout)...")
-        asyncio.run(run_with_timeout(command_list, env))
+        run_with_stuck_protection(command_list, env)
         print("Finished command with stuck protection")
     else:
         subprocess.run(command_list, env=env, check=True, text=True)
@@ -96,30 +100,47 @@ def run_noise_modelling(
         video_fps: int,
         input_folder: Path,
         output_folder: Path,
+        route_kml: Path = None,
 ):
     env = os.environ.copy()
     # env['JAVA_HOME'] = consts.JAVA_HOME
 
-    with open(input_folder / 'source.geojson', 'r', encoding='utf-8') as f:
-        source_geojson = json.loads(f.read())
-        source_points_geojson = source_geojson_to_points(
-            source_geojson=source_geojson,
-            source_height=source_height,
-            route_step_meters=route_step_meters,
-        )
-        modelling_area = points_to_bounding_square_geojson(source_points_geojson, size_meters=2000.0)
+    if route_kml is not None:
+        source_geojson = load_kml_routes(route_kml)
+    else:
+        with open(input_folder / 'source.geojson', 'r', encoding='utf-8') as f:
+            source_geojson = json.loads(f.read())
 
-    with open(input_folder / 'source_geojson_with_correct_height.geojson', 'w', encoding='utf-8') as f:
+    source_points_geojson = source_geojson_to_points(
+        source_geojson=source_geojson,
+        source_height=source_height,
+        route_step_meters=route_step_meters,
+    )
+    if route_kml is not None:
+        source_points_geojson = add_agl_height_from_asc(
+            source_points_geojson,
+            input_folder / "dtm.asc",
+            source_height,
+        )
+        source_points_geojson = apply_medium_agricultural_profile(
+            source_points_geojson,
+            normalize_route=True,
+        )
+    modelling_area = points_to_bounding_square_geojson(source_points_geojson, size_meters=2000.0)
+
+    prepared_source_path = output_folder / "source_prepared.geojson"
+    prepared_model_area_path = output_folder / "model_area_prepared.geojson"
+    with open(prepared_source_path, 'w', encoding='utf-8') as f:
         f.write(json.dumps(source_points_geojson))
 
-    with open(input_folder / 'modelling_area.geojson', 'w', encoding='utf-8') as f:
+    with open(prepared_model_area_path, 'w', encoding='utf-8') as f:
         f.write(json.dumps(modelling_area))
 
     db_setup_commands = [
         ClearDb(),
         ImportOsm(input_folder / 'osm_data.osm', 3857),
-        ImportFile(input_folder / 'source_geojson_with_correct_height.geojson', 3857, 'Source'),
-        ImportFile(input_folder / 'modelling_area.geojson', 3857, 'Model_Area'),
+        ImportFile(prepared_source_path, 3857, 'Source'),
+        ImportFile(prepared_model_area_path, 3857, 'Model_Area'),
         ImportAscFile(input_folder / 'dtm.asc', 3857),
     ]
 
@@ -191,6 +212,15 @@ def run_noise_modelling(
 
                 for idx in range(source_features_count):
                     frame_geojson = _single_source_feature_collection(source_points_geojson, idx)
+                    if route_kml is not None:
+                        # The aggregate flight map divides source energy across
+                        # all equal-time samples. An animation frame represents
+                        # the complete drone at one position, so restore the
+                        # full source spectrum for that frame.
+                        frame_geojson = apply_medium_agricultural_profile(
+                            frame_geojson,
+                            normalize_route=False,
+                        )
                     with open(temp_source_path, "w", encoding="utf-8") as f:
                         f.write(json.dumps(frame_geojson))
 
@@ -241,13 +271,23 @@ def run_noise_modelling(
 def main():
     parser = argparse.ArgumentParser(description='Run noise modelling with configurable parameters')
     
-    parser.add_argument('--source-height', type=float, required=True, help='Source height in meters')
+    parser.add_argument(
+        '--source-height',
+        type=float,
+        required=True,
+        help='Source height in meters; for KML routes this is height above ground level (AGL)',
+    )
     parser.add_argument('--order-of-reflections', type=int, required=True, help='Order of reflections')
     parser.add_argument('--vertical-diffraction', action='store_true', help='Enable vertical diffraction')
     parser.add_argument('--horizontal-diffraction', action='store_true', help='Enable horizontal diffraction')
     parser.add_argument('--receivers-layout', type=ReceiversLayout, required=True, 
                        choices=list(ReceiversLayout), help='Receivers layout type')
     parser.add_argument('--input-folder', type=Path, required=True, help='Input folder path containing source data')
+    parser.add_argument(
+        '--route-kml',
+        type=Path,
+        help='KML flight route. When supplied, replaces input-folder/source.geojson and uses the built-in medium agricultural drone profile.',
+    )
     parser.add_argument('--max-reflection-distance', type=int, default=200, help='Maximum reflection distance in meters')
     parser.add_argument('--route-step-meters', type=float, default=25.0, help='Sampling step (meters) for route sources')
     parser.add_argument('--export-route-video', action='store_true', help='Create per-route-point noise animation')
@@ -256,8 +296,11 @@ def main():
     args = parser.parse_args()
 
     print(f"Running noise modelling with parameters: {args}")
+    if args.route_kml is not None and not args.route_kml.is_file():
+        parser.error(f"KML route does not exist: {args.route_kml}")
 
-    output_folder_name = f"{args.input_folder.absolute().name}_height_{int(args.source_height)}_reflections_{args.order_of_reflections}_verticalDiff_{args.vertical_diffraction}_horizontalDiff_{args.horizontal_diffraction}_receiversLayout_{args.receivers_layout.value}"                    
+    run_name = args.route_kml.stem if args.route_kml is not None else args.input_folder.absolute().name
+    output_folder_name = f"{run_name}_height_{int(args.source_height)}_reflections_{args.order_of_reflections}_verticalDiff_{args.vertical_diffraction}_horizontalDiff_{args.horizontal_diffraction}_receiversLayout_{args.receivers_layout.value}"
     output_dir = Path(rf'./output/{output_folder_name}')
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -272,7 +315,8 @@ def main():
         export_route_video=args.export_route_video,
         video_fps=max(1, args.video_fps),
         input_folder=args.input_folder,
-        output_folder=output_dir
+        output_folder=output_dir,
+        route_kml=args.route_kml,
     )
 
 if __name__ == "__main__":

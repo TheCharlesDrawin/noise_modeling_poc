@@ -249,7 +249,7 @@ class NoiseLevelFromSource(Command):
             '-confDiffVertical', str(self.vertical_diffraction),
             '-confDiffHorizontal', str(self.horizontal_diffraction),
             '-confMaxSrcDist', str(20000),
-            '-confMaxReflDist', str(200),
+            '-confMaxReflDist', str(self.max_reflection_distance),
             '-confHumidity', str(70),
             '-confTemperature', str(30),
             '-confRaysName', "RAYS",

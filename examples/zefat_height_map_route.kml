@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>Zefat height-map drone route</name>
+    <Placemark>
+      <name>Medium agricultural drone survey route</name>
+      <description>Lawnmower route inside the bundled Zefat DTM footprint.</description>
+      <LineString>
+        <tessellate>1</tessellate>
+        <altitudeMode>relativeToGround</altitudeMode>
+        <coordinates>
+          35.50500,32.97900,100
+          35.52400,32.97900,100
+          35.52400,32.98230,100
+          35.50500,32.98230,100
+          35.50500,32.98560,100
+          35.52400,32.98560,100
+          35.52400,32.98890,100
+          35.50500,32.98890,100
+        </coordinates>
+      </LineString>
+    </Placemark>
+  </Document>
+</kml>
